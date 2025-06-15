@@ -245,7 +245,7 @@ def prepare_scheduler(scheduler):
 
 
 def load_example_yaml(example_name, yaml_path):
-    with open(yaml_path, 'r') as file:
+    with open(yaml_path, 'r', encoding='utf-8') as file:
             data = yaml.safe_load(file)
     yaml_data = None
     for d in data:
@@ -368,6 +368,11 @@ def merge_keyframes(all_keyframes, save_dir, save_folder='keyframes', fps=1):
     for i, frame in enumerate(all_keyframes):
         frame.save(save_path / f'{i}.png')
 
+    # Ensure all keyframes have the same size by resizing to the first frame's size
+    if all_keyframes:
+        target_size = all_keyframes[0].size
+        all_keyframes = [frame.resize(target_size) if frame.size != target_size else frame for frame in all_keyframes]
+    
     all_keyframes = [ToTensor()(frame).unsqueeze(0) for frame in all_keyframes]
     all_keyframes = torch.cat(all_keyframes, dim=0)
     video = (255 * all_keyframes).to(torch.uint8).detach().cpu()

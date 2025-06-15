@@ -7,6 +7,12 @@ from datetime import datetime
 from copy import deepcopy
 import json
 
+# Monkey patch to bypass transformers PyTorch version check
+import transformers.utils.import_utils
+def patched_is_torch_greater_or_equal(version):
+    return True  # Always return True to bypass version check
+transformers.utils.import_utils.is_torch_greater_or_equal = patched_is_torch_greater_or_equal
+
 from transformers import OneFormerForUniversalSegmentation, OneFormerProcessor
 import numpy as np
 import torch
@@ -75,7 +81,7 @@ def empty_cache():
 
 def seeding(seed):
     if seed == -1:
-        seed = np.random.randint(2 ** 32)
+        seed = np.random.randint(2 ** 31)  # Use 2^31 instead of 2^32 to stay within int32 bounds
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -106,11 +112,21 @@ def run(config):
 
     all_rundir = []
     yaml_data = load_example_yaml(config["example_name"], 'examples/examples.yaml')
-    start_keyframe = Image.open(yaml_data['image_filepath']).convert('RGB').resize((512, 512))
+    # Use aspect ratio from config if available, otherwise default to 512x512
+    image_width = config.get('image_width', 512)
+    image_height = config.get('image_height', 512)
+    start_keyframe = Image.open(yaml_data['image_filepath']).convert('RGB').resize((image_width, image_height))
     content_prompt, style_prompt, adaptive_negative_prompt, background_prompt, control_text = yaml_data['content_prompt'], yaml_data['style_prompt'], yaml_data['negative_prompt'], yaml_data.get('background', None), yaml_data.get('control_text', None)
     if adaptive_negative_prompt != "":
         adaptive_negative_prompt += ", "
     all_keyframes = [start_keyframe]
+    
+    # Load additional keyframes if they exist in the YAML
+    if 'keyframes' in yaml_data:
+        for keyframe_data in yaml_data['keyframes']:
+            if 'image_filepath' in keyframe_data:
+                keyframe_image = Image.open(keyframe_data['image_filepath']).convert('RGB').resize((image_width, image_height))
+                all_keyframes.append(keyframe_image)
     
     if isinstance(control_text, list):
         config['num_scenes'] = len(control_text)
@@ -162,9 +178,12 @@ def run(config):
                     if regen_id > 0:
                         seeding(-1)
                     depth_model, _, _, _ = load_model(torch.device("cuda"), 'dpt_beit_large_512.pt', 'dpt_beit_large_512', optimize=False)
-                    # first keyframe is loaded and estimated depth
-                    kf_gen = KeyframeGen(config, inpainter_pipeline, mask_generator, depth_model, vae, rotation, 
-                                        start_keyframe, inpainting_prompt, regen_negative_prompt + adaptive_negative_prompt,
+                    # Use the appropriate keyframe from all_keyframes based on current indices
+                    keyframe_index = i * config['num_keyframes'] + j
+                    current_keyframe = all_keyframes[keyframe_index] if keyframe_index < len(all_keyframes) else start_keyframe
+                    
+                    kf_gen = KeyframeGen(config, inpainter_pipeline, mask_generator, depth_model, vae, rotation,
+                                        current_keyframe, inpainting_prompt, regen_negative_prompt + adaptive_negative_prompt,
                                         segment_model=segment_model, segment_processor=segment_processor).to(config["device"])
                     save_root = Path(kf_gen.run_dir) / "images"
                     kf_idx = 0
@@ -219,8 +238,8 @@ def run(config):
                 kf_gen.update_images_and_masks(inpaint_output["latent"], render_output["inpaint_mask"])
 
                 kf2_depth_should_be = render_output['rendered_depth']
-                mask_to_align_depth = ~(render_output["inpaint_mask_512"]>0) & (kf2_depth_should_be < cutoff_depth + kf_gen.kf_delta_t)
-                mask_to_cutoff_depth = ~(render_output["inpaint_mask_512"]>0) & (kf2_depth_should_be >= cutoff_depth + kf_gen.kf_delta_t)
+                mask_to_align_depth = ~(render_output[f"inpaint_mask_{image_width}"]>0) & (kf2_depth_should_be < cutoff_depth + kf_gen.kf_delta_t)
+                mask_to_cutoff_depth = ~(render_output[f"inpaint_mask_{image_width}"]>0) & (kf2_depth_should_be >= cutoff_depth + kf_gen.kf_delta_t)
 
                 # with torch.no_grad():
                 #     kf2_before_ft_depth, _ = kf_gen.get_depth(kf_gen.images[kf_idx])  # pix depth under kf2 frame
@@ -253,7 +272,7 @@ def run(config):
                 kf1_depth, kf2_depth = kf_gen.depths[0], kf_gen.depths[-1]
                 kf1_image, kf2_image = kf_gen.images[0], kf_gen.images[1]
                 kf1_camera, kf2_camera = kf_gen.cameras[0], kf_gen.cameras[1]
-                kf2_mask = render_output["inpaint_mask_512"]
+                kf2_mask = render_output[f"inpaint_mask_{image_width}"]
                 kf_gen_dict = {'kf1_depth': kf1_depth, 'kf2_depth': kf2_depth, 'kf1_image': kf1_image, 'kf2_image': kf2_image, 
                             'kf1_camera': kf1_camera, 'kf2_camera': kf2_camera, 'kf2_mask': kf2_mask, 'inpainting_prompt': inpainting_prompt, 
                             'adaptive_negative_prompt': adaptive_negative_prompt, 'rotation': rotation}
@@ -303,7 +322,7 @@ def run(config):
             kf_interp.reset_additional_point_cloud()
             kf_interp.update_additional_point_cloud(kf2_depth_updated, kf2_image_upsample, valid_mask=kf2_mask_upsample, camera=kf2_camera_upsample, points_2d=kf_interp.points_kf2)
             
-            kf_interp.depths[0] = F.interpolate(kf2_depth_updated, size=(512, 512), mode="nearest")
+            kf_interp.depths[0] = F.interpolate(kf2_depth_updated, size=(image_height, image_width), mode="nearest")
             # save_depth_map(kf_interp.depths[0].detach().cpu().numpy(), save_root / 'kf2_depth.png', vmin=0, vmax=cutoff_depth*0.95, save_clean=True)
             # save_point_cloud_as_ply(kf_interp.additional_points_3d*500, kf_interp.run_dir / 'kf2_point_cloud.ply', kf_interp.additional_colors)
             # save_point_cloud_as_ply(kf_interp.points_3d *500, kf_interp.run_dir / 'kf1_point_cloud.ply', kf_interp.kf1_colors)
